@@ -10,7 +10,7 @@ class MAELoss(torch.nn.Module):
         super(MAELoss, self).__init__()
         pass
     def forward(self,y, y_hat):
-        return torch.mean(torch.abs(y-y_hat))
+        return torch.mean(torch.abs(y[:,1:]-y_hat[:,:-1]))
 
 def evaluate_model(model, data_loader):
     avg_loss = 0
@@ -20,7 +20,7 @@ def evaluate_model(model, data_loader):
     with torch.no_grad():
         for (i,(x,t,y)) in enumerate(data_loader):
             y_hat = model(x, t, y).squeeze()
-            loss = loss_fun(y_hat, y)
+            loss = loss_fun(y,y_hat)
             avg_loss += loss
     #this is just to deal with train and validation splits
         if isinstance(data_loader.dataset, torch.utils.data.Subset):
@@ -46,24 +46,24 @@ def experiment():
         interpolation_val_loader = DataLoader(interpolation_val_set,batch_size=16)
         extrapolation_val_loader = DataLoader(extrapolation_val_set, batch_size=16)
 
-        model = StaticFeatureTransformer(14, 256, 4, 512, 8, .3)
-        optimizer = torch.optim.Adam(model.parameters(),lr=.001,weight_decay=.004)
+        model = StaticFeatureTransformer(14, 256, 5, 512, 8, .25)
+        optimizer = torch.optim.Adam(model.parameters(),lr=.001,weight_decay=0.0005)
         loss_fun = torch.nn.MSELoss(reduction='mean')
         eval_loss_fun = MAELoss(reduction='mean')
 
-        lr_schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,T_max=200)
+        lr_schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,T_max=300)
 
-        for epoch in range(200):
+        for epoch in range(300):
             model.train()
             avg_train_loss = 0
             lr_schedule.step()
             for (i,(x,t,y)) in enumerate(train_loader):
                 optimizer.zero_grad()
                 y_hat = model(x,t,y).squeeze()
-                loss = loss_fun(y_hat,y)
+                loss = loss_fun(y_hat[:,:-1],y[:,1:])
                 loss.backward()
                 optimizer.step()
-                avg_train_loss += eval_loss_fun(y_hat,y).item()
+                avg_train_loss += eval_loss_fun(y,y_hat).item()
             avg_train_loss = (avg_train_loss*train_loader.dataset.dataset.y_std)/len(train_loader)
             interpolation_val_loss = evaluate_model(model,interpolation_val_loader)
             extrapolation_val_loss = evaluate_model(model, extrapolation_val_loader)

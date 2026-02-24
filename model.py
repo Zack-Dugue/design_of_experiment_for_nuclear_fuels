@@ -92,10 +92,11 @@ class PositionalEncoding(nn.Module):
             num_fourier_channels = embedding_size//2
         self.embedding_size = embedding_size
         time_seqs = self._create_time_seqs(MAX_LEN)
-        self.fourier_seqs = []
+        fourier_seqs = []
         for time_seq in time_seqs:
-            self.fourier_seqs.append(self._create_fourier_seq(time_seq, num_fourier_channels))
-        self.fourier_seqs = torch.stack(self.fourier_seqs, 0)
+            fourier_seqs.append(self._create_fourier_seq(time_seq, num_fourier_channels))
+        fourier_seqs = torch.stack(fourier_seqs, 0)
+        self.register_buffer('fourier_seqs', fourier_seqs)
 
     def forward(self,embedding,t):
         # note that here embedding is just the embedding of the time series
@@ -171,6 +172,12 @@ class StaticFeatureTransformer(nn.Module):
         for layer in self.layers:
             h = layer(h)
         return self.output_layer(h)
+
+    def decode(self, x, t):
+        y = torch.zeros(x.size(0), 1, 1)
+        for tau in range(len(t)):
+            y_hat = self.forward(x[tau], t[tau],y)
+            y = torch.cat([y,y_hat[:,-1].unsqueeze(-1)],1)
 
 import random
 if __name__ == '__main__':
