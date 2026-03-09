@@ -173,11 +173,64 @@ class StaticFeatureTransformer(nn.Module):
             h = layer(h)
         return self.output_layer(h)
 
-    def decode(self, x, t):
+    def decode(self, x, t, T):
         y = torch.zeros(x.size(0), 1, 1)
-        for tau in range(len(t)):
-            y_hat = self.forward(x[tau], t[tau],y)
+        for tau in range(T):
+            y_hat = self.forward(x, t ,torch.flatten(y,1,2))
             y = torch.cat([y,y_hat[:,-1].unsqueeze(-1)],1)
+        return y
+
+class ConvBlock(nn.Module):
+    def __init__(self, embed_dim, kernel_size, dropout_p=.5):
+        super().__init__()
+
+        self.conv0 = CausalConv1dSame(embed_dim, embed_dim, kernel_size)
+        self.conv1 = CausalConv1dSame(embed_dim, embed_dim, kernel_size)
+        self.dropout = nn.Dropout(dropout_p)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        h = self.dropout(self.norm(x))
+        h = torch.transpose(h,1,2).contiguous()
+        h = self.conv0(h)
+        h = self.act(h)
+        h = self.conv1(h)
+        h = torch.transpose(h,1,2).contiguous()
+
+        return x + h
+
+class StaticFeatureTCN(nn.Module):
+    def __init__(self, num_features,  embedding_size, num_layers, kernel_size, dropout=.35):
+        super(StaticFeatureTCN, self).__init__()
+        self.num_layers = num_layers
+        self.embedding_size = embedding_size
+        self.positional_encoding = PositionalEncoding(embedding_size)
+        self.feature_encoder = FeatureEncoder(num_features, embedding_size)
+
+        layer_list = nn.ModuleList([])
+
+        for layer in range(num_layers):
+            layer_list.append(ConvBlock(embedding_size,kernel_size))
+        self.layers = layer_list
+        self.output_dropout = nn.Dropout(p=dropout)
+        self.output_layer = nn.Linear(embedding_size,1)
+
+    def forward(self,x,t,y):
+        h = self.feature_encoder(x,y)
+        h = self.positional_encoding(h,t)
+        for layer in self.layers:
+            h = layer(h)
+        return self.output_layer(self.output_dropout(h))
+
+    def decode(self, x, t, T):
+        y = torch.zeros(x.size(0), 1)
+        for tau in range(1,T):
+            y_hat = self.forward(x, t,y)
+            y = torch.cat([y,y_hat[:,-1]],1)
+        return y
+
+
 
 import random
 if __name__ == '__main__':
@@ -186,7 +239,7 @@ if __name__ == '__main__':
     t = torch.Tensor(t)
     y = torch.randn(64,116)
     x = torch.randn(64,14)
-    feature_encoder = FeatureEncoder(14,36)
-    y = feature_encoder(x,y)
-    # result = pe(y, t)
-    # print(result)
+    model = StaticFeatureTCN(14,256,2,8,dropout=0)
+    T = 40
+    y = model.decode(x,t, T)
+    print(f"x = {x.size()}, y = {y.size()}, t = {t.size()}")

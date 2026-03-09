@@ -1,8 +1,9 @@
 import torch
 from load_data import HGRDataset
 from torch.utils.data import DataLoader
-from model import StaticFeatureTransformer
+from model import StaticFeatureTransformer, StaticFeatureTCN
 import glob
+
 
 
 class MAELoss(torch.nn.Module):
@@ -46,7 +47,8 @@ def experiment():
         interpolation_val_loader = DataLoader(interpolation_val_set,batch_size=16)
         extrapolation_val_loader = DataLoader(extrapolation_val_set, batch_size=16)
 
-        model = StaticFeatureTransformer(14, 256, 5, 512, 8, .25)
+        # model = StaticFeatureTransformer(14, 256, 5, 512, 8, .25)
+        model = StaticFeatureTCN(14,256,4,8,dropout=0)
         optimizer = torch.optim.Adam(model.parameters(),lr=.001,weight_decay=0.0005)
         loss_fun = torch.nn.MSELoss(reduction='mean')
         eval_loss_fun = MAELoss(reduction='mean')

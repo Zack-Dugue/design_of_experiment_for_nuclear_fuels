@@ -8,7 +8,7 @@ from sklearn.preprocessing import MinMaxScaler
 import joblib
 import torch
 from sklearn.preprocessing import OneHotEncoder
-
+from typing_extensions import override
 
 # Step 1: Read all CSV files
 file_paths = glob.glob('C:\\Users\\dugue\\Downloads\\Gustavo Code\\Code\\fuel/*.csv')  # Adjust to your file path
@@ -237,7 +237,10 @@ class HGRDataset(Dataset):
         self.seq_spacing_list = seq_spacing_list
         self.X = X
         self.y = y
+        self.forced_spacing = None
 
+    def over_ride_spacing(self,t ):
+        self.forced_spacing = t
 
     def __len__(self):
         return len(self.X)
@@ -245,17 +248,44 @@ class HGRDataset(Dataset):
     def __getitem__(self, idx):
         X = self.X[idx]
         y = self.y[idx]
-        spacing_type = self.seq_spacing_list[idx]
-        t = spacing_type
+        if self.forced_spacing is not None:
+            t = self.forced_spacing
+        else:
+            t = self.seq_spacing_list[idx]
 
         return X,t,y
+
+
+import csv
+from model import PositionalEncoding
+from utils import VEHICLE_STATIC_POSITIONS, compute_n_u235
+def create_synthetic_csv(path, U_percent, IV, density, n_u_235, t, MAX_LEN=120):
+    if os.path.exists(path):
+        os.remove(path)
+    with open(path, 'x',newline='') as f:
+        csv_writer = csv.writer(f)
+        time_series =    [step.item() for step in PositionalEncoding._create_time_seqs(MAX_LEN)[t]]
+        header = ["U%","Density","Thermal_Conductivity","IV","Digit1","Digit2","Digit3","N_U_235"]
+        header.extend(time_series[:MAX_LEN])
+        csv_writer.writerow(header)
+
+        for static_position in VEHICLE_STATIC_POSITIONS[IV]:
+            row = [U_percent, density, 0, IV, static_position[0], static_position[1], static_position[2], n_u_235]
+            row.extend([0 for step in time_series[:MAX_LEN]])
+            csv_writer.writerow(row)
+    print("finished creating synthetic csv")
+
 
 
 
 if __name__ == '__main__':
     file_paths = glob.glob("C:\\Users\\dugue\\Downloads\\Gustavo Code\\Code\\fuel/*.csv")  # Adjust to your file path
-    dataset = HGRDataset(file_paths)
-    X,t,y = dataset[62]
+    example_dataset = HGRDataset(file_paths, x_mean=None, x_std=None, y_mean=None, y_std=None)
+
+    create_synthetic_csv(
+        'test.csv',.8,2, 10920,1 )
+    dataset = HGRDataset(['test.csv'], x_mean=example_dataset.x_mean, x_std=example_dataset.x_std, y_mean=example_dataset.y_mean, y_std=example_dataset.y_std)
+    X,t,y = dataset[32]
     print(f"X = {X}")
     print(f"t = {t}")
     print(f"y = {y}")
