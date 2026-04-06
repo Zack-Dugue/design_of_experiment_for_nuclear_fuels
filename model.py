@@ -62,7 +62,7 @@ class AttentionBlock(nn.Module):
     def forward(self,x):
         h = self.layer_norm(x)
         h = self.dropout(h)
-        mask = torch.nn.Transformer.generate_square_subsequent_mask(x.size(1))
+        mask = torch.nn.Transformer.generate_square_subsequent_mask(x.size(1),device=x.device)
         h = self.attention(h,h,h,attn_mask = mask, is_causal=True)[0]
         x = x + h
         return x
@@ -105,7 +105,7 @@ class PositionalEncoding(nn.Module):
         t = t.bool().unsqueeze(-1).unsqueeze(-1)
         fourier = fourier[:,0,:,:] * (~t) + fourier[:,1,:,:] * (t)
         if fourier.size(-1) < embedding.size(-1):
-            padding = torch.zeros(fourier.size(0), fourier.size(1), embedding.size(2) - fourier.size(2))
+            padding = torch.zeros(fourier.size(0), fourier.size(1), embedding.size(2) - fourier.size(2),device=embedding.device)
             fourier = torch.cat((fourier, padding), -1)
         return embedding + fourier
 
@@ -174,7 +174,7 @@ class StaticFeatureTransformer(nn.Module):
         return self.output_layer(h)
 
     def decode(self, x, t, T):
-        y = torch.zeros(x.size(0), 1, 1)
+        y = torch.zeros(x.size(0), 1, 1, device=x.device)
         for tau in range(T):
             y_hat = self.forward(x, t ,torch.flatten(y,1,2))
             y = torch.cat([y,y_hat[:,-1].unsqueeze(-1)],1)

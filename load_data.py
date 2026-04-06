@@ -2,7 +2,6 @@ import pandas as pd
 import numpy as np
 import glob
 import os
-import tensorflow as tf
 import random
 from sklearn.preprocessing import MinMaxScaler
 import joblib
