@@ -174,4 +174,4 @@ if __name__ == '__main__':
     average_score = seq_ensemble.average_over_selection(.8, 13630,1,2.36E+20, 0)
     print(f"average_score: {average_score}")
     print("now trying optuna")
-    find_best_queries(sequence_ensemble=seq_ensemble, n_trials = 4, write_dir = 'outputs/test_run_3')
+    find_best_queries(sequence_ensemble=seq_ensemble, n_trials = 4, write_dir = 'outputs/test_run_2')
