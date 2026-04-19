@@ -6,6 +6,16 @@ import numpy as np
 import pandas as pd
 import torch
 import joblib
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from pathlib import Path
+from datetime import datetime
+from uuid import uuid4
+from typing import Union
+import torch
+import torch.nn as nn
 
 AVOGADRO = 6.02214076e23  # atoms / mol
 
@@ -427,3 +437,77 @@ def build_candidate_feature_batch(
 
     x = (x - x_mean_t) / x_std_t
     return x, metadata, float(n_u235)
+
+def save_module_unique(
+    module: nn.Module,
+    save_dir: Union[str, Path],
+    prefix: str = "model",
+    save_state_dict: bool = True,
+) -> Path:
+    """
+    Save a torch.nn.Module to a directory using a unique filename.
+
+    Args:
+        module: The PyTorch module to save.
+        save_dir: Directory to save into.
+        prefix: Prefix for the filename.
+        save_state_dict: If True, saves module.state_dict().
+                         If False, saves the full module object.
+
+    Returns:
+        Path to the saved file.
+    """
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    unique_id = uuid4().hex[:8]
+    filename = f"{prefix}_{timestamp}_{unique_id}.pt"
+    save_path = save_dir / filename
+
+    obj_to_save = module.state_dict() if save_state_dict else module
+    torch.save(obj_to_save, save_path)
+
+    return save_path
+
+
+from pathlib import Path
+from typing import Union
+import torch
+import torch.nn as nn
+
+
+def load_module(
+    module: nn.Module,
+    load_path: Union[str, Path],
+    map_location: str | torch.device = "cpu",
+    expects_state_dict: bool = True,
+) -> nn.Module:
+    """
+    Load weights or a full module from disk.
+
+    Args:
+        module: An already-constructed module. Required if expects_state_dict=True.
+        load_path: Path to the saved file.
+        map_location: Device mapping for torch.load.
+        expects_state_dict: If True, loads a state_dict into `module`.
+                            If False, loads and returns the full saved module.
+
+    Returns:
+        The loaded module.
+    """
+    load_path = Path(load_path)
+
+
+    if expects_state_dict:
+        loaded_obj = torch.load(load_path, map_location=map_location, weights_only=True)
+        module.load_state_dict(loaded_obj)
+        module.eval()
+        return module
+    else:
+        loaded_obj = torch.load(load_path, map_location=map_location, weights_only=False)
+
+        if not isinstance(loaded_obj, nn.Module):
+            raise TypeError("Loaded object is not a torch.nn.Module.")
+        loaded_obj.eval()
+        return loaded_obj

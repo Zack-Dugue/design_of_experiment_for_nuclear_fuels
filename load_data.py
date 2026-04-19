@@ -8,7 +8,9 @@ import joblib
 import torch
 from sklearn.preprocessing import OneHotEncoder
 from typing_extensions import override
-
+import csv
+from model import PositionalEncoding
+from utils import VEHICLE_STATIC_POSITIONS, compute_n_u235
 # Step 1: Read all CSV files
 file_paths = glob.glob('C:\\Users\\dugue\\Downloads\\Gustavo Code\\Code\\fuel/*.csv')  # Adjust to your file path
 
@@ -221,10 +223,13 @@ class HGRDataset(Dataset):
             x_mean =X.mean(0).unsqueeze(0)
         if x_std is None:
             x_std = X.std(0).unsqueeze(0)
+            x_std[x_std == 0] = 1
+
         if y_mean is None:
             y_mean = y.mean().unsqueeze(0)
         if y_std is None:
             y_std = y.std().unsqueeze(0)
+            y_std[y_std == 0] = 1
         X = (X - x_mean) / x_std
         y = (y - y_mean) / y_std
         self.x_mean = x_mean
@@ -255,9 +260,7 @@ class HGRDataset(Dataset):
         return X,t,y
 
 
-import csv
-from model import PositionalEncoding
-from utils import VEHICLE_STATIC_POSITIONS, compute_n_u235
+
 def create_synthetic_csv(path, U_percent, IV, density, n_u_235, t, MAX_LEN=120):
     if os.path.exists(path):
         os.remove(path)
@@ -272,17 +275,19 @@ def create_synthetic_csv(path, U_percent, IV, density, n_u_235, t, MAX_LEN=120):
             row = [U_percent, density, 0, IV, static_position[0], static_position[1], static_position[2], n_u_235]
             row.extend([0 for step in time_series[:MAX_LEN]])
             csv_writer.writerow(row)
-    print("finished creating synthetic csv")
 
 
 
-
+import time
 if __name__ == '__main__':
+
+    start = time.time()
     file_paths = glob.glob("C:\\Users\\dugue\\Downloads\\Gustavo Code\\Code\\fuel/*.csv")  # Adjust to your file path
     example_dataset = HGRDataset(file_paths, x_mean=None, x_std=None, y_mean=None, y_std=None)
-
+    end = time.time()
+    print("time to make the dataset: ", end-start)
     create_synthetic_csv(
-        'test.csv',.8,2, 10920,1 )
+        'test.csv',.8,2, 10920,1, 0)
     dataset = HGRDataset(['test.csv'], x_mean=example_dataset.x_mean, x_std=example_dataset.x_std, y_mean=example_dataset.y_mean, y_std=example_dataset.y_std)
     X,t,y = dataset[32]
     print(f"X = {X}")
