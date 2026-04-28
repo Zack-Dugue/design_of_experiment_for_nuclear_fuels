@@ -39,6 +39,22 @@ except Exception:
 
 
 # ============================================================
+# Warm-start / ensemble-diversity controls.
+# ============================================================
+
+# Setting both False means every ensemble is trained from a fresh random
+# initialization at each acquisition/search step. This is slower, but it avoids
+# the main correlation issue caused by repeatedly continuing the same members.
+WARM_START_REAL_ENSEMBLE = False
+WARM_START_LOOKAHEAD_ENSEMBLES = False
+
+# Give each ensemble member an explicit different initialization/shuffle seed.
+# This matters even when bootstrap samples differ, because otherwise worker
+# process RNG state can make members less independent than intended.
+USE_DISTINCT_MEMBER_SEEDS = True
+
+
+# ============================================================
 # Small CNN used by every ensemble member.
 # ============================================================
 
@@ -260,6 +276,27 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
+def make_member_seed(base_seed: int, member_id: int) -> int:
+    """
+    Deterministically create a different seed for each ensemble member.
+
+    This is separate from the active-learning seed. It helps keep ensemble
+    members decorrelated by giving each member a different initialization and
+    DataLoader shuffle stream, even if they are trained in persistent worker
+    processes.
+    """
+    return int((int(base_seed) + 1) * 1_000_003 + int(member_id) * 9_176 + 12_345)
+
+
+def set_worker_training_seed(seed: int):
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed % (2**32 - 1))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def bootstrap_sample_indices(base_indices: Sequence[int], rng: np.random.Generator) -> List[int]:
     base_indices = np.asarray(list(base_indices), dtype=np.int64)
     if len(base_indices) == 0:
@@ -372,6 +409,13 @@ def _train_member_worker(task: Dict) -> Dict:
         device = _WORKER_DEVICE
         use_amp = (_WORKER_AMP_ENABLED and device.type == "cuda")
 
+        member_seed = int(task.get("member_seed", 0))
+        if USE_DISTINCT_MEMBER_SEEDS:
+            set_worker_training_seed(member_seed)
+
+        loader_generator = torch.Generator()
+        loader_generator.manual_seed(member_seed)
+
         dataset = MixedMNISTTensorDataset(
             images=_WORKER_TRAIN_IMAGES,
             labels=_WORKER_TRAIN_LABELS,
@@ -387,6 +431,7 @@ def _train_member_worker(task: Dict) -> Dict:
             num_workers=_WORKER_DATALOADER_WORKERS,
             pin_memory=(device.type == "cuda"),
             persistent_workers=False,
+            generator=loader_generator,
         )
 
         model = SmallMNISTNet(feature_dim=task["feature_dim"])
@@ -569,6 +614,7 @@ class ParallelMemberTrainer:
                 "lr": float(lr),
                 "pseudo_loss_weight": float(pseudo_loss_weight),
                 "feature_dim": int(feature_dim),
+                "member_seed": make_member_seed(seed, member_id),
                 "init_state_dict": None if init_state_dicts is None else init_state_dicts[member_id],
             })
 
@@ -886,6 +932,7 @@ def simulate_environment_step(
     score_batch_size: int,
     score_dataloader_workers: int,
     seed: int,
+    use_warm_start: bool = WARM_START_LOOKAHEAD_ENSEMBLES,
 ) -> Tuple[SimulatedState, ClassifierEnsemble, Dict[int, float], Dict[str, float]]:
     parent_ensemble = node.load_ensemble(primary_device)
     pseudo_logits = pseudo_label_index(parent_ensemble, train_images, chosen_index, primary_device)
@@ -913,7 +960,7 @@ def simulate_environment_step(
         pseudo_loss_weight=pseudo_loss_weight,
         seed=seed,
         feature_dim=feature_dim,
-        warm_start_ensemble=parent_ensemble,
+        warm_start_ensemble=parent_ensemble if use_warm_start else None,
         eval_batch_size=score_batch_size,
         eval_dataloader_workers=score_dataloader_workers,
     )
@@ -1019,6 +1066,7 @@ def choose_query_with_lookahead(
                     score_batch_size=score_batch_size,
                     score_dataloader_workers=score_dataloader_workers,
                     seed=seed + 10 * search_iter + local_rank,
+                    use_warm_start=WARM_START_LOOKAHEAD_ENSEMBLES,
                 )
 
                 child = Node(
@@ -1113,6 +1161,7 @@ def fit_and_evaluate_real_state(
     score_dataloader_workers: int,
     seed: int,
     warm_start_ensemble: Optional[ClassifierEnsemble] = None,
+    use_warm_start: bool = WARM_START_REAL_ENSEMBLE,
 ) -> Tuple[ClassifierEnsemble, Dict[int, float], Dict[str, float]]:
     ensemble, train_metrics = trainer.train_ensemble(
         true_indices=state.labeled_true_indices,
@@ -1127,7 +1176,7 @@ def fit_and_evaluate_real_state(
         pseudo_loss_weight=1.0,
         seed=seed,
         feature_dim=feature_dim,
-        warm_start_ensemble=warm_start_ensemble,
+        warm_start_ensemble=warm_start_ensemble if use_warm_start else None,
         eval_batch_size=score_batch_size,
         eval_dataloader_workers=score_dataloader_workers,
     )
@@ -1222,8 +1271,12 @@ def run_strategy_experiment(
             score_dataloader_workers=score_dataloader_workers,
             seed=seed + 17 * step,
             warm_start_ensemble=previous_real_ensemble,
+            use_warm_start=WARM_START_REAL_ENSEMBLE,
         )
-        previous_real_ensemble = copy.deepcopy(ensemble).to_cpu_inplace()
+        if WARM_START_REAL_ENSEMBLE:
+            previous_real_ensemble = copy.deepcopy(ensemble).to_cpu_inplace()
+        else:
+            previous_real_ensemble = None
 
         row = {
             "strategy": strategy_name,
@@ -1236,6 +1289,8 @@ def run_strategy_experiment(
             "pool_max_uncertainty": float(eval_metrics["pool_max_uncertainty"]),
             "mean_true_ce": float(eval_metrics["mean_true_ce"]),
             "mean_pseudo_mse": float(eval_metrics["mean_pseudo_mse"]),
+            "warm_start_real_ensemble": bool(WARM_START_REAL_ENSEMBLE),
+            "warm_start_lookahead_ensembles": bool(WARM_START_LOOKAHEAD_ENSEMBLES),
         }
 
         if step == acquisition_steps or len(state.unlabeled_pool_indices) == 0:
@@ -1411,6 +1466,9 @@ def main():
 
     print(f"[info] Running sequential seeds: {seeds}", flush=True)
     print(f"[info] Running strategies: {strategies}", flush=True)
+    print(f"[info] WARM_START_REAL_ENSEMBLE={WARM_START_REAL_ENSEMBLE}", flush=True)
+    print(f"[info] WARM_START_LOOKAHEAD_ENSEMBLES={WARM_START_LOOKAHEAD_ENSEMBLES}", flush=True)
+    print(f"[info] USE_DISTINCT_MEMBER_SEEDS={USE_DISTINCT_MEMBER_SEEDS}", flush=True)
 
     try:
         for seed in seeds:
@@ -1432,9 +1490,9 @@ def main():
                     test_labels=test_labels,
                     primary_device=primary_device,
                     trainer=trainer,
-                    initial_labeled_size=50,
+                    initial_labeled_size=100,
                     pool_size=500,
-                    acquisition_steps=100,
+                    acquisition_steps=50,
                     num_members=max(1, min(5, len(device_ids) if len(device_ids) > 0 else 1)),
                     train_epochs=2,
                     batch_size=128,
