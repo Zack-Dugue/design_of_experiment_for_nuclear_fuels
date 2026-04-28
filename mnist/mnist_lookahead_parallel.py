@@ -2,7 +2,9 @@ import copy
 import os
 import random
 import time
+import traceback
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -39,34 +41,85 @@ except Exception:
 # Small CNN used by every ensemble member.
 # ============================================================
 
+import torch
+import torch.nn as nn
+
+
+class LayerNorm2d(nn.Module):
+    """
+    LayerNorm for NCHW conv features.
+
+    Usage:
+        nn.Conv2d(32, 64, 3, padding=1),
+        LayerNorm2d(64),
+        nn.ReLU()
+
+    This normalizes each sample independently across C,H,W.
+    Shape: [N, C, H, W]
+    """
+
+    def __init__(self, num_channels: int, eps: float = 1e-5, affine: bool = True):
+        super().__init__()
+        self.num_channels = num_channels
+        self.eps = eps
+        self.affine = affine
+
+        if affine:
+            # Per-channel affine parameters, like BatchNorm2d.
+            # Broadcasts over N,H,W.
+            self.weight = nn.Parameter(torch.ones(1, num_channels, 1, 1))
+            self.bias = nn.Parameter(torch.zeros(1, num_channels, 1, 1))
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4:
+            raise ValueError(f"LayerNorm2d expected 4D input [N,C,H,W], got shape {tuple(x.shape)}")
+
+        mean = x.mean(dim=(1, 2, 3), keepdim=True)
+        var = x.var(dim=(1, 2, 3), keepdim=True, unbiased=False)
+
+        x = (x - mean) / torch.sqrt(var + self.eps)
+
+        if self.affine:
+            x = x * self.weight + self.bias
+
+        return x
+
 class SmallMNISTNet(nn.Module):
     """
-    Deliberately small classifier so repeated retraining is tractable.
+    Small MNIST convnet for repeated retraining / active learning.
 
-    Important design choice:
-    - extract_features() gives a penultimate representation that we use for
-      feature-space query diversity.
-    - forward() returns logits, which are also what we pseudo-label with.
+    Input:  [N, 1, 28, 28]
+    Output: [N, 10]
     """
 
     def __init__(self, feature_dim: int = 64):
         super().__init__()
+
         self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
+        self.norm1 = nn.GroupNorm(1, 32)
+
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.norm2 = nn.GroupNorm(1, 64)
+
         self.pool = nn.MaxPool2d(2)
+
         self.fc1 = nn.Linear(64 * 7 * 7, feature_dim)
         self.fc2 = nn.Linear(feature_dim, 10)
 
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.relu(self.conv1(x))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = self.pool(x)
+        x = self.pool(F.relu(self.norm1(self.conv1(x))))  # [N, 32, 14, 14]
+        x = self.pool(F.relu(self.norm2(self.conv2(x))))  # [N, 64, 7, 7]
         x = torch.flatten(x, 1)
-        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc1(x))                           # [N, feature_dim]
         return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(self.extract_features(x))
+        features = self.extract_features(x)
+        logits = self.fc2(features)
+        return logits
 
 
 # ============================================================
@@ -220,7 +273,7 @@ def evaluate_ensemble_accuracy(
     test_labels: torch.Tensor,
     device: torch.device,
     batch_size: int = 512,
-    dataloader_workers: int = 2,
+    dataloader_workers: int = 0,
 ) -> float:
     ensemble.eval()
     ensemble.to_device_inplace(device)
@@ -232,7 +285,7 @@ def evaluate_ensemble_accuracy(
         shuffle=False,
         num_workers=dataloader_workers,
         pin_memory=(device.type == "cuda"),
-        persistent_workers=(dataloader_workers > 0),
+        persistent_workers=False,
     )
 
     correct = 0
@@ -285,90 +338,120 @@ def _parallel_worker_init(
         pass
 
 
+def _make_grad_scaler(device: torch.device, enabled: bool):
+    if not enabled:
+        try:
+            return torch.amp.GradScaler(device.type, enabled=False)
+        except Exception:
+            if device.type == "cuda":
+                return torch.cuda.amp.GradScaler(enabled=False)
+            return None
+
+    try:
+        return torch.amp.GradScaler(device.type, enabled=enabled)
+    except Exception:
+        if device.type == "cuda":
+            return torch.cuda.amp.GradScaler(enabled=enabled)
+        return None
+
+
 def _train_member_worker(task: Dict) -> Dict:
     """
     Train ONE ensemble member in a dedicated worker process.
 
-    The worker returns a CPU state_dict and a couple scalar metrics. Returning
-    just the state_dict keeps serialization overhead low.
+    IMPORTANT:
+    This is wrapped in try/except so Python-side worker failures print their
+    traceback instead of only surfacing as BrokenProcessPool in the parent.
     """
-    assert _WORKER_TRAIN_IMAGES is not None
-    assert _WORKER_TRAIN_LABELS is not None
-    assert _WORKER_DEVICE is not None
+    try:
+        assert _WORKER_TRAIN_IMAGES is not None
+        assert _WORKER_TRAIN_LABELS is not None
+        assert _WORKER_DEVICE is not None
 
-    device = _WORKER_DEVICE
-    use_amp = (_WORKER_AMP_ENABLED and device.type == "cuda")
+        device = _WORKER_DEVICE
+        use_amp = (_WORKER_AMP_ENABLED and device.type == "cuda")
 
-    dataset = MixedMNISTTensorDataset(
-        images=_WORKER_TRAIN_IMAGES,
-        labels=_WORKER_TRAIN_LABELS,
-        true_indices=task["true_indices"],
-        pseudo_logits_by_index=task["pseudo_logits_by_index"],
-        sampled_indices=task["bootstrap_indices"],
-    )
+        dataset = MixedMNISTTensorDataset(
+            images=_WORKER_TRAIN_IMAGES,
+            labels=_WORKER_TRAIN_LABELS,
+            true_indices=task["true_indices"],
+            pseudo_logits_by_index=task["pseudo_logits_by_index"],
+            sampled_indices=task["bootstrap_indices"],
+        )
 
-    loader = DataLoader(
-        dataset,
-        batch_size=task["batch_size"],
-        shuffle=True,
-        num_workers=_WORKER_DATALOADER_WORKERS,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(_WORKER_DATALOADER_WORKERS > 0),
-    )
+        loader = DataLoader(
+            dataset,
+            batch_size=task["batch_size"],
+            shuffle=True,
+            num_workers=_WORKER_DATALOADER_WORKERS,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=False,
+        )
 
-    model = SmallMNISTNet(feature_dim=task["feature_dim"])
-    if task["init_state_dict"] is not None:
-        model.load_state_dict(task["init_state_dict"])
-    model.to(device)
+        model = SmallMNISTNet(feature_dim=task["feature_dim"])
+        if task["init_state_dict"] is not None:
+            model.load_state_dict(task["init_state_dict"])
+        model.to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=task["lr"])
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        optimizer = torch.optim.Adam(model.parameters(), lr=task["lr"])
+        scaler = _make_grad_scaler(device, enabled=use_amp)
 
-    total_true_ce = 0.0
-    total_pseudo_mse = 0.0
-    total_batches = 0
+        total_true_ce = 0.0
+        total_pseudo_mse = 0.0
+        total_batches = 0
 
-    model.train()
-    for _ in range(task["epochs"]):
-        for images, true_labels, target_logits, use_pseudo in loader:
-            images = images.to(device, non_blocking=True)
-            true_labels = true_labels.to(device, non_blocking=True)
-            target_logits = target_logits.to(device, non_blocking=True)
-            use_pseudo = use_pseudo.to(device, non_blocking=True)
+        model.train()
+        for _ in range(task["epochs"]):
+            for images, true_labels, target_logits, use_pseudo in loader:
+                images = images.to(device, non_blocking=True)
+                true_labels = true_labels.to(device, non_blocking=True)
+                target_logits = target_logits.to(device, non_blocking=True)
+                use_pseudo = use_pseudo.to(device, non_blocking=True)
 
-            optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad(set_to_none=True)
 
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-                logits = model(images)
-                loss = torch.zeros((), device=device)
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                    logits = model(images)
+                    loss = torch.zeros((), device=device)
 
-                true_mask = (use_pseudo == 0)
-                if true_mask.any():
-                    ce_loss = F.cross_entropy(logits[true_mask], true_labels[true_mask])
-                    loss = loss + ce_loss
-                    total_true_ce += float(ce_loss.detach().item())
+                    true_mask = (use_pseudo == 0)
+                    if true_mask.any():
+                        ce_loss = F.cross_entropy(logits[true_mask], true_labels[true_mask])
+                        loss = loss + ce_loss
+                        total_true_ce += float(ce_loss.detach().item())
 
-                pseudo_mask = (use_pseudo == 1)
-                if pseudo_mask.any():
-                    mse_loss = F.mse_loss(logits[pseudo_mask], target_logits[pseudo_mask])
-                    loss = loss + task["pseudo_loss_weight"] * mse_loss
-                    total_pseudo_mse += float(mse_loss.detach().item())
+                    pseudo_mask = (use_pseudo == 1)
+                    if pseudo_mask.any():
+                        mse_loss = F.mse_loss(logits[pseudo_mask], target_logits[pseudo_mask])
+                        loss = loss + task["pseudo_loss_weight"] * mse_loss
+                        total_pseudo_mse += float(mse_loss.detach().item())
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            total_batches += 1
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
 
-    state_dict = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-    model.cpu()
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+                total_batches += 1
 
-    return {
-        "state_dict": state_dict,
-        "mean_true_ce": total_true_ce / max(total_batches, 1),
-        "mean_pseudo_mse": total_pseudo_mse / max(total_batches, 1),
-    }
+        state_dict = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+        model.cpu()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            torch.cuda.empty_cache()
+
+        return {
+            "state_dict": state_dict,
+            "mean_true_ce": total_true_ce / max(total_batches, 1),
+            "mean_pseudo_mse": total_pseudo_mse / max(total_batches, 1),
+        }
+
+    except Exception as e:
+        print(f"[train worker failed on device={_WORKER_DEVICE}] {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+        raise
 
 
 def _train_member_local(
@@ -394,10 +477,6 @@ def _train_member_local(
 class ParallelMemberTrainer:
     """
     Persistent trainer with one worker process per GPU.
-
-    This is the main parallelism upgrade over the earlier code. Instead of
-    training ensemble members sequentially in Python, we train them concurrently
-    across multiple GPUs.
     """
 
     def __init__(
@@ -414,6 +493,11 @@ class ParallelMemberTrainer:
         self.dataloader_workers_per_worker = int(dataloader_workers_per_worker)
         self.amp_enabled = bool(amp_enabled and torch.cuda.is_available())
         self.executors: List[ProcessPoolExecutor] = []
+        self._build_executors()
+
+    def _build_executors(self):
+        self.shutdown()
+        self.executors = []
 
         if len(self.device_ids) > 0:
             ctx = mp.get_context("spawn")
@@ -434,7 +518,11 @@ class ParallelMemberTrainer:
 
     def shutdown(self):
         for executor in self.executors:
-            executor.shutdown(wait=True, cancel_futures=False)
+            try:
+                executor.shutdown(wait=True, cancel_futures=False)
+            except Exception:
+                pass
+        self.executors = []
 
     def train_ensemble(
         self,
@@ -452,14 +540,8 @@ class ParallelMemberTrainer:
         feature_dim: int = 64,
         warm_start_ensemble: Optional[ClassifierEnsemble] = None,
         eval_batch_size: int = 512,
-        eval_dataloader_workers: int = 2,
+        eval_dataloader_workers: int = 0,
     ) -> Tuple[ClassifierEnsemble, Dict[str, float]]:
-        """
-        Train an ensemble, using all available GPU workers if possible.
-
-        Warm starting matters a lot here because each active-learning step only
-        adds ONE new item, so retraining from scratch is usually wasted work.
-        """
         members = []
         member_metrics = []
 
@@ -492,11 +574,45 @@ class ParallelMemberTrainer:
         parallel_available = (len(self.executors) > 0 and primary_device.type == "cuda")
 
         if parallel_available and num_members > 1:
-            futures = []
-            for member_id, task in enumerate(tasks):
-                executor = self.executors[member_id % len(self.executors)]
-                futures.append(executor.submit(_train_member_worker, task))
-            results = [future.result() for future in futures]
+            try:
+                futures = []
+                for member_id, task in enumerate(tasks):
+                    executor = self.executors[member_id % len(self.executors)]
+                    futures.append(executor.submit(_train_member_worker, task))
+                results = [future.result() for future in futures]
+
+            except BrokenProcessPool:
+                print("[ParallelMemberTrainer] BrokenProcessPool detected. Rebuilding executors and falling back to sequential local training for this round.", flush=True)
+                self._build_executors()
+                results = []
+                for task in tasks:
+                    results.append(
+                        _train_member_local(
+                            train_images=self.train_images,
+                            train_labels=self.train_labels,
+                            device=primary_device,
+                            dataloader_workers=0,
+                            amp_enabled=self.amp_enabled,
+                            task=task,
+                        )
+                    )
+
+            except Exception:
+                print("[ParallelMemberTrainer] Parallel member training failed. Rebuilding executors and falling back to sequential local training for this round.", flush=True)
+                traceback.print_exc()
+                self._build_executors()
+                results = []
+                for task in tasks:
+                    results.append(
+                        _train_member_local(
+                            train_images=self.train_images,
+                            train_labels=self.train_labels,
+                            device=primary_device,
+                            dataloader_workers=0,
+                            amp_enabled=self.amp_enabled,
+                            task=task,
+                        )
+                    )
         else:
             results = []
             for task in tasks:
@@ -505,7 +621,7 @@ class ParallelMemberTrainer:
                         train_images=self.train_images,
                         train_labels=self.train_labels,
                         device=primary_device,
-                        dataloader_workers=self.dataloader_workers_per_worker,
+                        dataloader_workers=0,
                         amp_enabled=self.amp_enabled,
                         task=task,
                     )
@@ -552,7 +668,7 @@ def compute_grid_scores(
     candidate_indices: Sequence[int],
     device: torch.device,
     batch_size: int = 512,
-    dataloader_workers: int = 2,
+    dataloader_workers: int = 0,
 ) -> Dict[int, float]:
     if len(candidate_indices) == 0:
         return {}
@@ -567,7 +683,7 @@ def compute_grid_scores(
         shuffle=False,
         num_workers=dataloader_workers,
         pin_memory=(device.type == "cuda"),
-        persistent_workers=(dataloader_workers > 0),
+        persistent_workers=False,
     )
 
     scores = {}
@@ -592,7 +708,7 @@ def compute_feature_embeddings(
     candidate_indices: Sequence[int],
     device: torch.device,
     batch_size: int = 512,
-    dataloader_workers: int = 2,
+    dataloader_workers: int = 0,
 ) -> Dict[int, torch.Tensor]:
     if len(candidate_indices) == 0:
         return {}
@@ -607,7 +723,7 @@ def compute_feature_embeddings(
         shuffle=False,
         num_workers=dataloader_workers,
         pin_memory=(device.type == "cuda"),
-        persistent_workers=(dataloader_workers > 0),
+        persistent_workers=False,
     )
 
     feats = {}
@@ -770,13 +886,6 @@ def simulate_environment_step(
     score_dataloader_workers: int,
     seed: int,
 ) -> Tuple[SimulatedState, ClassifierEnsemble, Dict[int, float], Dict[str, float]]:
-    """
-    One simulated tree expansion.
-
-    Huge speed choice:
-    - warm-start child training from the parent ensemble because the simulated
-      dataset only changes by one pseudo-labeled point.
-    """
     parent_ensemble = node.load_ensemble(primary_device)
     pseudo_logits = pseudo_label_index(parent_ensemble, train_images, chosen_index, primary_device)
 
@@ -842,18 +951,10 @@ def choose_query_with_lookahead(
     pseudo_loss_weight: float = 1.0,
     feature_dim: int = 64,
     score_batch_size: int = 512,
-    score_dataloader_workers: int = 2,
+    score_dataloader_workers: int = 0,
     feature_screen_size: int = 512,
     seed: int = 0,
 ) -> Tuple[int, Dict[str, object]]:
-    """
-    Build a lookahead tree and return the best root child.
-
-    Important speedup over the earlier MNIST version:
-    - we DO NOT retrain the root ensemble inside lookahead
-    - we reuse the already-trained real-state ensemble and pool scores from the
-      outer active-learning step
-    """
     sim_state = SimulatedState(
         labeled_true_indices=list(real_state.labeled_true_indices),
         unlabeled_pool_indices=list(real_state.unlabeled_pool_indices),
@@ -876,9 +977,6 @@ def choose_query_with_lookahead(
     for search_iter in range(num_search_iters):
         iter_start = time.perf_counter()
 
-        # Two-stage proposal:
-        # 1) use uncertainty to screen the pool down to a manageable subset
-        # 2) compute feature-space diversity only on that screened subset
         screened = screen_top_uncertain(current_node.grid_scores, feature_screen_size)
         current_ensemble = current_node.load_ensemble(primary_device)
         feature_cache = compute_feature_embeddings(
@@ -1015,13 +1113,6 @@ def fit_and_evaluate_real_state(
     seed: int,
     warm_start_ensemble: Optional[ClassifierEnsemble] = None,
 ) -> Tuple[ClassifierEnsemble, Dict[int, float], Dict[str, float]]:
-    """
-    Train the *real* ensemble on currently true-labeled data only.
-
-    Important speedup:
-    - supports warm starting from the previous real-state ensemble because each
-      outer step only adds one new true label.
-    """
     ensemble, train_metrics = trainer.train_ensemble(
         true_indices=state.labeled_true_indices,
         pseudo_logits_by_index={},
@@ -1061,12 +1152,6 @@ def fit_and_evaluate_real_state(
 # ============================================================
 
 def build_mnist_tensors(data_root: str = "./data"):
-    """
-    Load MNIST once and convert to shared-memory tensors.
-
-    This matters for multiprocessing because all GPU workers read the same CPU
-    tensors rather than making private copies of the dataset.
-    """
     transform = transforms.ToTensor()
     train_dataset = datasets.MNIST(root=data_root, train=True, download=True, transform=transform)
     test_dataset = datasets.MNIST(root=data_root, train=False, download=True, transform=transform)
@@ -1104,19 +1189,10 @@ def run_strategy_experiment(
     lookahead_lambda: float = 0.35,
     feature_dim: int = 64,
     score_batch_size: int = 512,
-    score_dataloader_workers: int = 2,
+    score_dataloader_workers: int = 0,
     feature_screen_size: int = 512,
     seed: int = 0,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Run one full active-learning experiment.
-
-    Major structural speedup relative to the earlier version:
-    - the outer loop trains/evaluates the real model ONCE per step
-    - uncertainty baseline uses those already-computed pool scores
-    - lookahead reuses the already-computed root ensemble and root scores
-      instead of retraining them from scratch
-    """
     rng = random.Random(seed)
     state = initialize_real_state(train_labels, initial_labeled_size, pool_size, seed)
 
@@ -1167,18 +1243,10 @@ def run_strategy_experiment(
 
         if strategy_name == "random":
             chosen_index = rng.choice(state.unlabeled_pool_indices)
-            strategy_info = {"strategy": "random"}
-
         elif strategy_name == "uncertainty":
-            # Reuse the pool scores from the already trained real ensemble.
             chosen_index = max(pool_scores.keys(), key=lambda idx: pool_scores[idx])
-            strategy_info = {
-                "strategy": "uncertainty",
-                "root_score": float(eval_metrics["pool_mean_uncertainty"]),
-            }
-
         elif strategy_name == "lookahead":
-            chosen_index, strategy_info = choose_query_with_lookahead(
+            chosen_index, _ = choose_query_with_lookahead(
                 real_state=state,
                 train_images=train_images,
                 train_labels=train_labels,
@@ -1234,24 +1302,11 @@ def run_strategy_experiment(
 # ============================================================
 
 def main():
-    """
-    Practical default configuration for multi-GPU runs.
-
-    Notes on using up to 8 GPUs:
-    - set device_ids to the GPUs you want to use
-    - set num_members <= len(device_ids) for the cleanest one-member-per-GPU layout
-    - if num_members > len(device_ids), jobs queue per GPU rather than collide
-
-    Other speedups already wired in:
-    - persistent one-process-per-GPU member trainer
-    - mixed precision in GPU workers
-    - warm starts for real-state retraining
-    - warm starts for child simulated retraining
-    - reuse of root ensemble / root grid scores in lookahead
-    - top-K uncertainty screening before feature-diversity scoring
-    - tensor-backed MNIST + shared memory for worker processes
-    """
     set_seed(0)
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
 
     available_gpus = torch.cuda.device_count()
     if available_gpus == 0:
@@ -1302,7 +1357,7 @@ def main():
                 lookahead_lambda=0.35,
                 feature_dim=64,
                 score_batch_size=512,
-                score_dataloader_workers=2,
+                score_dataloader_workers=0,
                 feature_screen_size=512,
                 seed=0,
             )
