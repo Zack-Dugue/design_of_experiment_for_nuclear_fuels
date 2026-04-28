@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
@@ -1202,7 +1203,7 @@ def run_strategy_experiment(
 
     for step in range(acquisition_steps + 1):
         outer_start = time.perf_counter()
-        print(f"\rAcquisition Step : {step}", end="")
+        print(f"[seed={seed}] [strategy={strategy_name}] acquisition_step={step}/{acquisition_steps}", flush=True)
 
         ensemble, pool_scores, eval_metrics = fit_and_evaluate_real_state(
             state=state,
@@ -1226,6 +1227,7 @@ def run_strategy_experiment(
 
         row = {
             "strategy": strategy_name,
+            "seed": int(seed),
             "step": step,
             "num_true_labels": len(state.labeled_true_indices),
             "num_unlabeled_pool": len(state.unlabeled_pool_indices),
@@ -1278,6 +1280,7 @@ def run_strategy_experiment(
         true_label = int(train_labels[int(chosen_index)].item())
         query_rows.append({
             "strategy": strategy_name,
+            "seed": int(seed),
             "step": step,
             "chosen_index": int(chosen_index),
             "true_label": true_label,
@@ -1296,6 +1299,75 @@ def run_strategy_experiment(
     print("\nAcquisition concluded")
     return pd.DataFrame(history_rows), pd.DataFrame(query_rows)
 
+
+
+def plot_accuracy_curves_with_error_bands(
+    history_df: pd.DataFrame,
+    output_path: str,
+    *,
+    x_col: str = "num_true_labels",
+    y_col: str = "test_accuracy",
+    group_col: str = "strategy",
+    seed_col: str = "seed",
+    error: str = "sem",
+):
+    """
+    Plot mean accuracy over seeds with shaded error bands.
+
+    error="sem" gives mean +/- standard error of the mean.
+    error="std" gives mean +/- standard deviation across seeds.
+    """
+    required_cols = {x_col, y_col, group_col, seed_col}
+    missing_cols = required_cols - set(history_df.columns)
+    if missing_cols:
+        raise ValueError(f"Missing required columns for error-band plot: {missing_cols}")
+
+    per_seed = (
+        history_df
+        .groupby([group_col, seed_col, x_col], as_index=False)[y_col]
+        .mean()
+    )
+
+    summary = (
+        per_seed
+        .groupby([group_col, x_col], as_index=False)
+        .agg(
+            mean=(y_col, "mean"),
+            std=(y_col, "std"),
+            n=(y_col, "count"),
+        )
+    )
+    summary["std"] = summary["std"].fillna(0.0)
+    summary["sem"] = summary["std"] / np.sqrt(summary["n"].clip(lower=1))
+
+    if error == "sem":
+        err_col = "sem"
+        ylabel = "Validation/Test accuracy (mean +/- SEM)"
+    elif error == "std":
+        err_col = "std"
+        ylabel = "Validation/Test accuracy (mean +/- STD)"
+    else:
+        raise ValueError("error must be either 'sem' or 'std'")
+
+    plt.figure(figsize=(9, 6))
+    for strategy, sdf in summary.groupby(group_col):
+        sdf = sdf.sort_values(x_col)
+        x = sdf[x_col].to_numpy()
+        mean = sdf["mean"].to_numpy()
+        err_vals = sdf[err_col].to_numpy()
+
+        line = plt.plot(x, mean, marker="o", linewidth=2, label=strategy)[0]
+        color = line.get_color()
+        plt.fill_between(x, mean - err_vals, mean + err_vals, alpha=0.20, color=color)
+
+    plt.xlabel("Number of true labels")
+    plt.ylabel(ylabel)
+    plt.title("Active Learning Strategy Comparison Across Seeds")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
 
 # ============================================================
 # Script entrypoint.
@@ -1316,7 +1388,7 @@ def main():
         device_ids = list(range(min(8, available_gpus)))
         primary_device = torch.device(f"cuda:{device_ids[0]}")
 
-    print(f"Using device_ids={device_ids} | primary_device={primary_device}")
+    print(f"Using device_ids={device_ids} | primary_device={primary_device}", flush=True)
 
     train_images, train_labels, test_images, test_labels = build_mnist_tensors()
 
@@ -1334,35 +1406,65 @@ def main():
     strategy_histories = []
     strategy_queries = []
 
+    seeds = list(range(10))
+    strategies = ["random", "uncertainty", "lookahead"]
+
+    print(f"[info] Running sequential seeds: {seeds}", flush=True)
+    print(f"[info] Running strategies: {strategies}", flush=True)
+
     try:
-        for strategy in ["random", "uncertainty", "lookahead"]:
-            print(f"\nRunning strategy: {strategy}")
-            history_df, query_df = run_strategy_experiment(
-                strategy_name=strategy,
-                train_images=train_images,
-                train_labels=train_labels,
-                test_images=test_images,
-                test_labels=test_labels,
-                primary_device=primary_device,
-                trainer=trainer,
-                initial_labeled_size=100,
-                pool_size=5000,
-                acquisition_steps=25,
-                num_members=max(1, min(4, len(device_ids) if len(device_ids) > 0 else 1)),
-                train_epochs=2,
-                batch_size=128,
-                lr=1e-3,
-                lookahead_search_iters=2,
-                lookahead_branching=3,
-                lookahead_lambda=0.35,
-                feature_dim=64,
-                score_batch_size=512,
-                score_dataloader_workers=0,
-                feature_screen_size=512,
-                seed=0,
-            )
-            strategy_histories.append(history_df)
-            strategy_queries.append(query_df)
+        for seed in seeds:
+            set_seed(seed)
+            print("\n" + "=" * 80, flush=True)
+            print(f"[seed={seed}] starting", flush=True)
+            print("=" * 80, flush=True)
+
+            for strategy in strategies:
+                print("\n" + "-" * 80, flush=True)
+                print(f"[seed={seed}] [strategy={strategy}] starting", flush=True)
+                print("-" * 80, flush=True)
+
+                history_df, query_df = run_strategy_experiment(
+                    strategy_name=strategy,
+                    train_images=train_images,
+                    train_labels=train_labels,
+                    test_images=test_images,
+                    test_labels=test_labels,
+                    primary_device=primary_device,
+                    trainer=trainer,
+                    initial_labeled_size=50,
+                    pool_size=500,
+                    acquisition_steps=100,
+                    num_members=max(1, min(5, len(device_ids) if len(device_ids) > 0 else 1)),
+                    train_epochs=2,
+                    batch_size=128,
+                    lr=1e-3,
+                    lookahead_search_iters=3,
+                    lookahead_branching=3,
+                    lookahead_lambda=0.35,
+                    feature_dim=64,
+                    score_batch_size=512,
+                    score_dataloader_workers=0,
+                    feature_screen_size=512,
+                    seed=seed,
+                )
+
+                # Defensive assignment in case run_strategy_experiment is edited later.
+                history_df["seed"] = int(seed)
+                query_df["seed"] = int(seed)
+
+                strategy_histories.append(history_df)
+                strategy_queries.append(query_df)
+
+                # Save partial outputs after every seed/strategy so long jobs leave usable results.
+                partial_history = pd.concat(strategy_histories, ignore_index=True)
+                partial_queries = pd.concat(strategy_queries, ignore_index=True)
+                save_dataframe(partial_history, os.path.join(artifacts_dir, "mnist_strategy_history_partial.csv"))
+                save_dataframe(partial_queries, os.path.join(artifacts_dir, "mnist_query_history_partial.csv"))
+
+                print(f"[seed={seed}] [strategy={strategy}] finished", flush=True)
+
+            print(f"[seed={seed}] finished all strategies", flush=True)
     finally:
         trainer.shutdown()
 
@@ -1372,12 +1474,29 @@ def main():
     save_dataframe(all_history, os.path.join(artifacts_dir, "mnist_strategy_history.csv"))
     save_dataframe(all_queries, os.path.join(artifacts_dir, "mnist_query_history.csv"))
 
+    # Keep the original plots.
     plot_accuracy_curves(all_history, os.path.join(artifacts_dir, "mnist_accuracy_curves.png"))
     plot_uncertainty_curves(all_history, os.path.join(artifacts_dir, "mnist_uncertainty_curves.png"))
     plot_runtime_curves(all_history, os.path.join(artifacts_dir, "mnist_runtime_curves.png"))
     plot_query_trajectory(all_queries, os.path.join(artifacts_dir, "mnist_query_trajectory.png"))
 
-    print(f"\nSaved artifacts to: {artifacts_dir}")
+    # Add multi-seed shaded-error plots for cleaner strategy comparison.
+    plot_accuracy_curves_with_error_bands(
+        all_history,
+        os.path.join(artifacts_dir, "mnist_accuracy_curves_mean_sem.png"),
+        error="sem",
+    )
+    plot_accuracy_curves_with_error_bands(
+        all_history,
+        os.path.join(artifacts_dir, "mnist_accuracy_curves_mean_std.png"),
+        error="std",
+    )
+
+    print(f"\nSaved artifacts to: {artifacts_dir}", flush=True)
+    print(f"[info] Wrote mnist_strategy_history.csv with seeds 0-9", flush=True)
+    print(f"[info] Wrote mnist_query_history.csv with seeds 0-9", flush=True)
+    print(f"[info] Wrote mnist_accuracy_curves_mean_sem.png", flush=True)
+    print(f"[info] Wrote mnist_accuracy_curves_mean_std.png", flush=True)
 
 
 if __name__ == "__main__":
