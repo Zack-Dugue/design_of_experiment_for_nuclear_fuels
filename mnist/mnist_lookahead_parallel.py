@@ -1455,7 +1455,7 @@ def main():
         amp_enabled=True,
     )
 
-    artifacts_dir = "mnist_lookahead_parallel_artifacts"
+    artifacts_dir = "mnist_lookahead_parallel_artifacts_no_warm_restards"
     ensure_dir(artifacts_dir)
 
     strategy_histories = []
