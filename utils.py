@@ -503,7 +503,7 @@ def load_module(
         loaded_obj = torch.load(load_path, map_location=map_location, weights_only=True)
         module.load_state_dict(loaded_obj)
         module.eval()
-        return module
+        return modulet
     else:
         loaded_obj = torch.load(load_path, map_location=map_location, weights_only=False)
 
