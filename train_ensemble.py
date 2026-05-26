@@ -365,8 +365,8 @@ def train_ensembles(
 
 if __name__ == "__main__":
     train_ensembles(
-        device=torch.device("cpu"),
+        device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         file_paths=glob.glob("HGR_fuel/" + "*.csv"),
-        per_fuel_ensembles=1,
-        T=40,
+        per_fuel_ensembles=3,
+        T=200,
     )
