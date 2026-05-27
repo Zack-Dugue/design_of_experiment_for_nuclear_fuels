@@ -1,6 +1,7 @@
 import csv
 import glob
 import os
+from typing import Dict, Tuple
 
 import joblib
 import numpy as np
@@ -44,6 +45,43 @@ if N_STATIC_COLUMNS != 7:
     )
 
 
+# -----------------------------------------------------------------------------
+# In-memory synthetic CSV cache
+# -----------------------------------------------------------------------------
+# Old calling pattern elsewhere in the project can stay exactly the same:
+#
+#     create_synthetic_csv("test.csv", ...)
+#     dataset = HGRDataset(["test.csv"], ...)
+#
+# The difference is that create_synthetic_csv no longer has to write a real CSV.
+# It stores a DataFrame in this module-level cache, and load_data checks this
+# cache before falling back to pd.read_csv(path).
+_SYNTHETIC_CSV_CACHE: Dict[str, pd.DataFrame] = {}
+
+
+def _cache_key(path):
+    return os.path.abspath(os.fspath(path))
+
+
+def _resolve_time_values_np(t, max_len):
+    time_values = resolve_time_values(t, max_len=max_len)
+    if isinstance(time_values, torch.Tensor):
+        time_values = time_values.detach().cpu().numpy()
+    else:
+        time_values = np.asarray(time_values)
+    return time_values[:max_len].astype(np.float32, copy=False)
+
+
+def _onehot_col6(col6):
+    """Fast fixed one-hot equivalent to OneHotEncoder(categories=[[1..6]])."""
+    col6 = np.asarray(col6)
+    out = np.zeros((col6.shape[0], 6), dtype=np.float32)
+    valid = (col6 >= 1) & (col6 <= 6) & np.isfinite(col6)
+    if np.any(valid):
+        out[np.where(valid)[0], col6[valid].astype(np.int64) - 1] = 1.0
+    return out
+
+
 def truncate_row(row, total_length):
     if len(row) < total_length:
         return None
@@ -71,6 +109,14 @@ def _validate_csv_header(path, df):
         )
 
 
+def _read_csv_or_cached(path):
+    key = _cache_key(path)
+    if key in _SYNTHETIC_CSV_CACHE:
+        # Return a copy so downstream truncation/renaming cannot mutate the cache.
+        return _SYNTHETIC_CSV_CACHE[key].copy()
+    return pd.read_csv(path)
+
+
 def load_data(file_paths, target_length=None):
     """
     Load HGR/BURNUP CSV files and return a combined dataframe plus per-row time values.
@@ -81,11 +127,16 @@ def load_data(file_paths, target_length=None):
 
     If target_length is None, the loader truncates every file to the shortest
     available time-series length in the provided file list.
+
+    Speed patch:
+        Paths previously produced by create_synthetic_csv are read from an
+        in-memory cache instead of disk. This preserves the old call sequence
+        while avoiding the slow write/read loop for synthetic query datasets.
     """
     if len(file_paths) == 0:
         raise ValueError("load_data received no file paths.")
 
-    all_data = [pd.read_csv(file) for file in file_paths]
+    all_data = [_read_csv_or_cached(file) for file in file_paths]
     for path, df in zip(file_paths, all_data):
         _validate_csv_header(path, df)
 
@@ -116,107 +167,127 @@ def load_data(file_paths, target_length=None):
             )
 
         file_time_values = parse_time_columns(df.columns[N_STATIC_COLUMNS : N_STATIC_COLUMNS + target_length])
+        file_time_values = np.asarray(file_time_values, dtype=np.float32)
         schedule_id = infer_registered_schedule_id(file_time_values)
 
-        truncated_rows = []
-        for row in df[df.columns].values:
-            truncated = truncate_row(row, total_columns_to_keep)
-            if truncated is not None:
-                truncated_rows.append(truncated)
-                time_value_list.append(file_time_values.copy())
-                schedule_id_list.append(schedule_id)
-
-        truncated_df = pd.DataFrame(np.array(truncated_rows), columns=column_labels)
+        # Old code iterated row-by-row and rebuilt a dataframe from a list.
+        # Slicing once is much faster and produces the same combined format.
+        truncated_arr = df.iloc[:, :total_columns_to_keep].to_numpy(copy=True)
+        truncated_df = pd.DataFrame(truncated_arr, columns=column_labels)
         truncated_data.append(truncated_df)
+
+        n_rows = truncated_arr.shape[0]
+        time_value_list.extend([file_time_values] * n_rows)
+        schedule_id_list.extend([schedule_id] * n_rows)
 
     upsampled_data_combined = pd.concat(truncated_data, ignore_index=True)
     return upsampled_data_combined, time_value_list, schedule_id_list
 
 
 def build_RAS_mapper(size, upsampled_data_combined, path="RAS.csv"):
+    """
+    Vectorized replacement for the original iterrows/DataFrame.loc loop.
+    Returns the same shape: (size, 2), columns [R, A].
+    """
     ras_df = pd.read_csv(path)
-    ras_mapped = np.full((size, 2), np.nan, dtype=float)
+    ras_mapped = np.full((size, 2), np.nan, dtype=np.float32)
 
-    for i, row in upsampled_data_combined.iterrows():
-        col3_val = row.iloc[3]  # IV
-        col4_val = row.iloc[4]  # Digit1
-        col5_val = row.iloc[5]  # Digit2
-        col6_val = row.iloc[6]  # Digit3
+    data = upsampled_data_combined.iloc[:, :N_STATIC_COLUMNS].apply(pd.to_numeric, errors="coerce")
+    iv = data.iloc[:, 3].to_numpy()
+    d1 = data.iloc[:, 4].to_numpy()
+    d2 = data.iloc[:, 5].to_numpy()
+    d3 = data.iloc[:, 6].to_numpy()
 
-        if col3_val == 2:
-            match_r = ras_df.loc[ras_df.iloc[:, 3] == col4_val]
-            if not match_r.empty:
-                ras_mapped[i, 0] = match_r.iloc[0, 4]
+    # Build lookup dictionaries once instead of filtering ras_df for every row.
+    ras = ras_df.apply(pd.to_numeric, errors="coerce")
 
-            match_a = ras_df.loc[(ras_df.iloc[:, 0] == col5_val) & (ras_df.iloc[:, 1] == col6_val)]
-            if not match_a.empty:
-                ras_mapped[i, 1] = match_a.iloc[0, 2]
+    # IV == 2 mappings
+    r_map_iv2 = dict(zip(ras.iloc[:, 3], ras.iloc[:, 4]))
+    a_map_iv2 = dict(zip(zip(ras.iloc[:, 0], ras.iloc[:, 1]), ras.iloc[:, 2]))
 
-        elif col3_val == 1:
-            match_r = ras_df.loc[ras_df.iloc[:, 8] == col4_val]
-            if not match_r.empty:
-                ras_mapped[i, 0] = match_r.iloc[0, 9]
+    # IV == 1 mappings
+    r_map_iv1 = dict(zip(ras.iloc[:, 8], ras.iloc[:, 9]))
+    a_map_iv1 = dict(zip(zip(ras.iloc[:, 5], ras.iloc[:, 6]), ras.iloc[:, 7]))
 
-            match_a = ras_df.loc[(ras_df.iloc[:, 5] == col5_val) & (ras_df.iloc[:, 6] == col6_val)]
-            if not match_a.empty:
-                ras_mapped[i, 1] = match_a.iloc[0, 7]
+    mask2 = iv == 2
+    if np.any(mask2):
+        idx = np.where(mask2)[0]
+        ras_mapped[idx, 0] = np.array([r_map_iv2.get(v, np.nan) for v in d1[idx]], dtype=np.float32)
+        ras_mapped[idx, 1] = np.array(
+            [a_map_iv2.get((a, b), np.nan) for a, b in zip(d2[idx], d3[idx])],
+            dtype=np.float32,
+        )
+
+    mask1 = iv == 1
+    if np.any(mask1):
+        idx = np.where(mask1)[0]
+        ras_mapped[idx, 0] = np.array([r_map_iv1.get(v, np.nan) for v in d1[idx]], dtype=np.float32)
+        ras_mapped[idx, 1] = np.array(
+            [a_map_iv1.get((a, b), np.nan) for a, b in zip(d2[idx], d3[idx])],
+            dtype=np.float32,
+        )
 
     return ras_mapped
 
+
 def encode(upsampled_data_combined):
-    Data = pd.DataFrame(upsampled_data_combined).copy()
+    """
+    Fast vectorized encoder.
 
-    # Extract y BEFORE adding any engineered columns.
-    y = Data.iloc[:, N_STATIC_COLUMNS:].values
+    Output is compatible with the previous encode():
+        X_full columns:
+            col0, col1, col5, col3_encoded, col4_encoded, onehot(col6: 1..6)
+        y:
+            all target/time columns
+    """
+    data = pd.DataFrame(upsampled_data_combined)
 
-    Data = Data.rename(
-        columns={
-            Data.columns[0]: "col0",  # U%
-            Data.columns[1]: "col1",  # Density
-            Data.columns[2]: "col2",  # Thermal_Conductivity
-            Data.columns[3]: "col3",  # IV
-            Data.columns[4]: "col4",  # Digit1
-            Data.columns[5]: "col5",  # Digit2
-            Data.columns[6]: "col6",  # Digit3
-        }
-    )
+    y = data.iloc[:, N_STATIC_COLUMNS:].to_numpy(dtype=np.float32, copy=True)
 
-    for col in ["col0", "col1", "col2", "col3", "col4", "col5", "col6"]:
-        Data[col] = pd.to_numeric(Data[col], errors="coerce")
+    static = data.iloc[:, :N_STATIC_COLUMNS].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    arr = static.to_numpy(dtype=np.float32, copy=False)
 
-    col3_map = {2: 1, 1: 3}
-    Data["col3_encoded"] = Data["col3"].map(col3_map).fillna(0)
+    col0 = arr[:, 0]
+    col1 = arr[:, 1]
+    col3 = arr[:, 3]
+    col4 = arr[:, 4]
+    col5 = arr[:, 5]
+    col6 = arr[:, 6]
 
-    def encode_col4(row):
-        val3 = row["col3"]
-        val4 = row["col4"]
-        if val3 == 1:
-            mapping = {1: 3, 2: 3, 5: 2, 3: 2, 4: 1}
-        elif val3 == 2:
-            mapping = {2: 2, 3: 2, 1: 1}
-        else:
-            mapping = {}
-        return mapping.get(val4, 0)
+    col3_encoded = np.zeros_like(col3, dtype=np.float32)
+    col3_encoded[col3 == 2] = 1.0
+    col3_encoded[col3 == 1] = 3.0
 
-    Data["col4_encoded"] = Data.apply(encode_col4, axis=1)
+    col4_encoded = np.zeros_like(col4, dtype=np.float32)
 
-    encoder = OneHotEncoder(
-        categories=[[1, 2, 3, 4, 5, 6]],
-        sparse_output=False,
-        handle_unknown="ignore",
-    )
-    nominal_encoded = encoder.fit_transform(Data[["col6"]])
+    # Original encode_col4(row):
+    # if col3 == 1: {1:3, 2:3, 5:2, 3:2, 4:1}
+    mask = col3 == 1
+    col4_encoded[mask & ((col4 == 1) | (col4 == 2))] = 3.0
+    col4_encoded[mask & ((col4 == 5) | (col4 == 3))] = 2.0
+    col4_encoded[mask & (col4 == 4)] = 1.0
+
+    # if col3 == 2: {2:2, 3:2, 1:1}
+    mask = col3 == 2
+    col4_encoded[mask & ((col4 == 2) | (col4 == 3))] = 2.0
+    col4_encoded[mask & (col4 == 1)] = 1.0
+
+    nominal_encoded = _onehot_col6(col6)
 
     X_full = np.concatenate(
         [
-            Data[["col0", "col1", "col5"]].fillna(0).values,
-            Data[["col3_encoded", "col4_encoded"]].fillna(0).values,
+            col0[:, None],
+            col1[:, None],
+            col5[:, None],
+            col3_encoded[:, None],
+            col4_encoded[:, None],
             nominal_encoded,
         ],
         axis=1,
-    )
+    ).astype(np.float32, copy=False)
 
     return X_full, y
+
 
 def RAS_Encode(X, ras_mapped):
     # encode() currently emits:
@@ -284,18 +355,27 @@ class HGRDataset(Dataset):
             file_paths,
             target_length=target_length,
         )
-        print("\nDEBUG AFTER load_data")
-        print("combined shape:", upsampled_data_combined.shape)
-        print("N_STATIC_COLUMNS:", N_STATIC_COLUMNS)
-        print("len(time_value_list[0]):", len(time_value_list[0]))
-        print("first 12 combined columns:", list(upsampled_data_combined.columns[:12]))
-        print("last 10 combined columns:", list(upsampled_data_combined.columns[-10:]))
+
+        # Leave these off by default because they become noisy and slow when
+        # synthetic query datasets are created repeatedly. Set this env var if
+        # you need the old debugging output:
+        #   set HGR_DATASET_DEBUG=1        # Windows cmd
+        #   $env:HGR_DATASET_DEBUG="1"     # PowerShell
+        #   export HGR_DATASET_DEBUG=1     # bash
+        if os.environ.get("HGR_DATASET_DEBUG", "0") == "1":
+            print("\nDEBUG AFTER load_data")
+            print("combined shape:", upsampled_data_combined.shape)
+            print("N_STATIC_COLUMNS:", N_STATIC_COLUMNS)
+            print("len(time_value_list[0]):", len(time_value_list[0]))
+            print("first 12 combined columns:", list(upsampled_data_combined.columns[:12]))
+            print("last 10 combined columns:", list(upsampled_data_combined.columns[-10:]))
+
         ras_mapper = build_RAS_mapper(len(upsampled_data_combined), upsampled_data_combined)
         X, y = encode(upsampled_data_combined)
         X = RAS_Encode(X, ras_mapper)
 
-        X = torch.from_numpy(np.array(X)).float()
-        y = torch.from_numpy(np.array(y)).float()
+        X = torch.from_numpy(np.asarray(X, dtype=np.float32)).float()
+        y = torch.from_numpy(np.asarray(y, dtype=np.float32)).float()
         time_values = torch.from_numpy(np.stack(time_value_list, axis=0)).float()
 
         if time_values.shape[1] != y.shape[1]:
@@ -368,41 +448,58 @@ class HGRDataset(Dataset):
 
 def create_synthetic_csv(path, U_percent, IV, density, n_u_235, t, MAX_LEN=120):
     """
-    Create a synthetic query CSV using the same 7-static-column format as the
-    real processed files. The n_u_235 argument is kept for backward-compatible
-    call sites, but is not written as a static column.
+    Backward-compatible synthetic query creator.
+
+    IMPORTANT SPEED CHANGE:
+        This function no longer writes a physical CSV by default. Instead, it
+        creates the exact same synthetic table in memory and stores it in
+        _SYNTHETIC_CSV_CACHE under the requested path. Then existing code like
+
+            create_synthetic_csv("test.csv", ...)
+            dataset = HGRDataset(["test.csv"], ...)
+
+        still works, because load_data checks the cache before using pd.read_csv.
+
+    The n_u_235 argument is kept for backward-compatible call sites, but is not
+    written as a static column because the current processed CSV format has
+    exactly 7 static columns.
     """
-    if os.path.exists(path):
-        os.remove(path)
+    time_series = _resolve_time_values_np(t, MAX_LEN)
 
-    time_series = [float(step.item()) for step in resolve_time_values(t, max_len=MAX_LEN)]
+    positions = np.asarray(VEHICLE_STATIC_POSITIONS[IV], dtype=np.float32)
+    n_rows = positions.shape[0]
 
-    with open(path, "x", newline="") as f:
-        csv_writer = csv.writer(f)
-        header = [
-            "U%",
-            "Density",
-            "Thermal_Conductivity",
-            "IV",
-            "Digit1",
-            "Digit2",
-            "Digit3",
+    static_block = np.column_stack(
+        [
+            np.full(n_rows, U_percent, dtype=np.float32),
+            np.full(n_rows, density, dtype=np.float32),
+            np.zeros(n_rows, dtype=np.float32),
+            np.full(n_rows, IV, dtype=np.float32),
+            positions[:, 0],
+            positions[:, 1],
+            positions[:, 2],
         ]
-        header.extend(time_series[:MAX_LEN])
-        csv_writer.writerow(header)
+    )
 
-        for static_position in VEHICLE_STATIC_POSITIONS[IV]:
-            row = [
-                U_percent,
-                density,
-                0,
-                IV,
-                static_position[0],
-                static_position[1],
-                static_position[2],
-            ]
-            row.extend([0 for _ in time_series[:MAX_LEN]])
-            csv_writer.writerow(row)
+    y_block = np.zeros((n_rows, len(time_series)), dtype=np.float32)
+    arr = np.concatenate([static_block, y_block], axis=1)
+
+    # Keep the actual time values in the headers, matching the previous on-disk
+    # CSV behavior. load_data will parse these headers into time_value_list.
+    header = EXPECTED_STATIC_COLUMNS_7 + [str(float(v)) for v in time_series.tolist()]
+    df = pd.DataFrame(arr, columns=header)
+
+    _SYNTHETIC_CSV_CACHE[_cache_key(path)] = df
+
+    # Avoid accidentally reading an old stale test.csv if another path variant
+    # misses the cache later. This is best-effort only.
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+    return path
 
 
 if __name__ == "__main__":
