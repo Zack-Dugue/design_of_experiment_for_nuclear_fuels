@@ -219,6 +219,6 @@ if __name__ == "__main__":
         sequence_ensemble=seq_ensemble,
         n_trials=100,
         num_samples=3,
-        gamma=0.0,
+        gamma=2,
         write_dir="outputs/test_run_3",
     )
