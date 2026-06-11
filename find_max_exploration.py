@@ -221,5 +221,5 @@ if __name__ == "__main__":
         n_trials=100,
         num_samples=3,
         gamma=2,
-        write_dir="outputs/test_run_4",
+        write_dir="outputs/test_run_5",
     )
