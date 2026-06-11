@@ -107,6 +107,7 @@ def make_objective(
             # Use minimum distance to encourage separation from the closest
             # already-selected query.
             diversity_score = min(distances)
+            print(f"Diversity score: {diversity_score}")
 
         return uncertainty_score + gamma * diversity_score
 
