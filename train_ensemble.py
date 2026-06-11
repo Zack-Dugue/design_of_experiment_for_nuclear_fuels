@@ -113,7 +113,7 @@ class SequenceEnsemble(nn.Module):
         distance = ((y_1 - y_2) ** 2).mean()
         return distance
 
-    def compute_distance(self, X_1, X_2, MAX_ITERS=50, path="tmp.csv", batch_size=32, simple=True, target_length=72):
+    def compute_distance(self, X_1, X_2, MAX_ITERS=50, path="tmp.csv", batch_size=32, simple=False, target_length=50):
         with torch.no_grad():
             u_percent, IV, density, n_u_235, t = X_1
             create_synthetic_csv(path, u_percent, IV, density, n_u_235, t, MAX_LEN=target_length)
