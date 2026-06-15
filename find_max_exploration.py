@@ -196,14 +196,15 @@ if __name__ == "__main__":
     y_mean = torch.Tensor([171.1579])
     y_std = torch.Tensor([105.260])
 
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device = {device}")
     seq_ensemble = SequenceEnsemble(
         "ensembles",
-        x_mean.to(device),
-        x_std.to(device),
-        y_mean.to(device),
-        y_std.to(device),
+        x_mean,
+        x_std,
+        y_mean,
+        y_std,
         device=device,
     )
 
