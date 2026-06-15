@@ -395,7 +395,7 @@ class HGRDataset(Dataset):
         if y_std is None:
             y_std = y.std().unsqueeze(0)
         y_std[y_std == 0] = 1
-        print("In HGRDataset X device = {X.device} , x_mean device = {x_mean.device}")
+        print(f"In HGRDataset X device = {X.device} , x_mean device = {x_mean.device}")
         X = (X - x_mean) / x_std
         y = (y - y_mean) / y_std
 
