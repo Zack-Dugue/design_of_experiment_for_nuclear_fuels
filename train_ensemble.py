@@ -89,6 +89,7 @@ class SequenceEnsemble(nn.Module):
         target_length=72,
     ):
         create_synthetic_csv(path, u_percent, IV, density, n_u_235, t, MAX_LEN=target_length)
+        print(f"average over selection x_mean = {self.x_mean}")
         averaging_dataset = HGRDataset(
             [path],
             x_mean=self.x_mean,
