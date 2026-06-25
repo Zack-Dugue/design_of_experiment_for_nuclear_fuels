@@ -43,8 +43,7 @@ TIME_SCHEDULE_GAPS: Dict[int, list[float]] = {
 }
 
 
-N_STATIC_COLUMNS = 7
-
+N_STATIC_COLUMNS = 9
 
 def create_time_sequence_from_gaps(gaps: Sequence[float], max_len: int) -> torch.Tensor:
     """
