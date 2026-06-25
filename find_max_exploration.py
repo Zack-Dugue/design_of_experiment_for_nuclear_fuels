@@ -385,8 +385,8 @@ if __name__ == "__main__":
         sequence_ensemble=seq_ensemble,
         n_trials=100,
         num_samples=3,
-        gamma=2,
-        write_dir="outputs/test_run_9col",
+        gamma=1,
+        write_dir="outputs/test_run_new_data",
         schedule_ids=[2],
         target_length=EXPLORATION_TARGET_LENGTH,
     )
