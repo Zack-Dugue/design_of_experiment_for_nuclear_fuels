@@ -536,6 +536,93 @@ class HGRDataset(Dataset):
 # =============================================================================
 
 
+AXIAL_MAP = {
+    "VXF": {
+        (3, 6): 254.611, (3, 5): 230.111, (3, 4): 205.611,
+        (3, 3): 181.111, (3, 2): 156.611, (3, 1): 132.111,
+        (2, 6): 54.65, (2, 5): 30.15, (2, 4): 5.65,
+        (2, 3): -18.85, (2, 2): -43.35, (2, 1): -67.85,
+        (1, 6): -145.3115, (1, 5): -169.8115, (1, 4): -194.3115,
+        (1, 3): -218.8115, (1, 2): -243.3115, (1, 1): -267.8115,
+    },
+    "RB": {
+        (3, 6): 276.611, (3, 5): 252.111, (3, 4): 227.611,
+        (3, 3): 203.111, (3, 2): 178.611, (3, 1): 154.111,
+        (2, 6): 76.65, (2, 5): 52.15, (2, 4): 27.65,
+        (2, 3): 3.15, (2, 2): -21.35, (2, 1): -45.85,
+        (1, 6): -123.3115, (1, 5): -147.8115, (1, 4): -172.3115,
+        (1, 3): -196.8115, (1, 2): -221.3115, (1, 1): -245.8115,
+    },
+}
+
+RADIAL_MAP = {
+    "VXF": {1: 401.32, 2: 387.505, 3: 387.505},
+    "RB": {1: 260.3889, 2: 260.3889, 3: 277.9464, 4: 288.7, 5: 277.9464},
+}
+
+
+def _vehicle_label(iv):
+    """
+    Convert a caller's irradiation-vehicle value into the geometry-map label.
+
+    Loader/model convention:
+        RB  -> 1
+        VXF -> 2
+
+    Real CSVs usually contain string labels, while old exploration code often
+    passes numeric ids.
+    """
+    if isinstance(iv, str):
+        s = iv.strip().upper()
+        if s in {"RB", "RABBIT", "HFIR", "1", "1.0"}:
+            return "RB"
+        if s in {"VXF", "VX-F", "2", "2.0"}:
+            return "VXF"
+
+    try:
+        iv_code = int(float(iv))
+    except (TypeError, ValueError):
+        iv_code = int(float(_vehicle_code(pd.Series([iv]))[0]))
+
+    if iv_code == 1:
+        return "RB"
+    if iv_code == 2:
+        return "VXF"
+
+    raise ValueError(f"Unknown Irradiation_Vehicle {iv!r}; expected RB/1 or VXF/2.")
+
+
+def _physical_coords_from_ras(iv, r, a, s):
+    """
+    Deterministically reproduce the preprocessor's coordinate construction.
+
+    Radial_R depends on (Irradiation_Vehicle, R).
+    Axial_Z depends on (Irradiation_Vehicle, A, S).
+    """
+    iv_label = _vehicle_label(iv)
+    r = int(r)
+    a = int(a)
+    s = int(s)
+
+    try:
+        radial_r = RADIAL_MAP[iv_label][r]
+    except KeyError as exc:
+        raise KeyError(
+            f"No Radial_R mapping for IV={iv_label}, R={r}. "
+            f"Known R values: {sorted(RADIAL_MAP[iv_label])}"
+        ) from exc
+
+    try:
+        axial_z = AXIAL_MAP[iv_label][(a, s)]
+    except KeyError as exc:
+        raise KeyError(
+            f"No Axial_Z mapping for IV={iv_label}, A={a}, S={s}. "
+            f"Known (A,S) values: {sorted(AXIAL_MAP[iv_label])}"
+        ) from exc
+
+    return float(radial_r), float(axial_z)
+
+
 def _vehicle_position_key(iv):
     if iv in VEHICLE_STATIC_POSITIONS:
         return iv
@@ -568,8 +655,14 @@ def create_synthetic_csv(path, U_percent, IV, density, n_u_235, t, MAX_LEN=120):
         Enrichment, TD_Density, Irradiation_Vehicle, R, A, S,
         N_U-235, Radial_R, Axial_Z, timestep0, timestep1, ...
 
-    Radial_R and Axial_Z are set to 0 unless VEHICLE_STATIC_POSITIONS provides
-    physical coordinate columns after [R, A, S].
+    Radial_R and Axial_Z are filled using the same deterministic geometry maps
+    used by the preprocessing script:
+
+        Radial_R = RADIAL_MAP[IV][R]
+        Axial_Z  = AXIAL_MAP[IV][(A, S)]
+
+    This keeps synthetic exploration queries on the same coordinate manifold as
+    the real training CSVs.
     """
     time_series = _resolve_time_values_np(t, MAX_LEN)
 
@@ -583,12 +676,21 @@ def create_synthetic_csv(path, U_percent, IV, density, n_u_235, t, MAX_LEN=120):
             f"Got shape {positions.shape}."
         )
 
-    if positions.shape[1] >= 5:
-        radial_r = positions[:, 3].astype(np.float32)
-        axial_z = positions[:, 4].astype(np.float32)
-    else:
-        radial_r = np.zeros(n_rows, dtype=np.float32)
-        axial_z = np.zeros(n_rows, dtype=np.float32)
+    coords = np.array(
+        [
+            _physical_coords_from_ras(
+                IV,
+                positions[i, 0],  # R
+                positions[i, 1],  # A
+                positions[i, 2],  # S
+            )
+            for i in range(n_rows)
+        ],
+        dtype=np.float32,
+    )
+
+    radial_r = coords[:, 0]
+    axial_z = coords[:, 1]
 
     static_block = np.column_stack(
         [
@@ -656,7 +758,7 @@ if __name__ == "__main__":
     print("y shape:", example_dataset.y.shape)
     print("time_values shape:", example_dataset.time_values.shape)
 
-    create_synthetic_csv("test.csv", 0.8, 2, 10920, 1, 0, MAX_LEN=72)
+    create_synthetic_csv("test.csv", 0.8, 2, 9.864, 1, 0, MAX_LEN=72)
     dataset = HGRDataset(
         ["test.csv"],
         x_mean=example_dataset.x_mean,
